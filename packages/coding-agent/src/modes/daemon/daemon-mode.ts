@@ -9,9 +9,9 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { readFile, rm, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -458,8 +458,6 @@ export function isTerminalRemoteAgentMessageError(error: unknown): error is Erro
 }
 
 export class AgentDaemon {
-	/** Max artifact-dir removals per opportunistic reap (bounds deletion latency). */
-	private static readonly RLM_ARTIFACT_REAP_LIMIT = 50;
 	private server?: Server;
 	private shuttingDown = false;
 	private readonly updateRestartQueuePauses = new Map<string, { release(): void }>();
@@ -1153,59 +1151,6 @@ export class AgentDaemon {
 		// Deletion boundary: transcript + display tombstone are the durable
 		// record and stay; the nested artifact dir is a runtime cache and goes.
 		await this.deleteRlmSubagentArtifacts(childId, entry.sessionFile);
-		await this.reapDeletedRlmSubagentArtifacts(parentState);
-	}
-
-	/**
-	 * Reap leftover artifact dirs of this parent's tombstoned children, capped
-	 * at {@link AgentDaemon.RLM_ARTIFACT_REAP_LIMIT} removals per call. Safe
-	 * because a spawn record is awaited at admission before any artifacts
-	 * exist, so a live child always has a non-deleted edge here.
-	 */
-	private async reapDeletedRlmSubagentArtifacts(parentState: ActiveSessionState): Promise<void> {
-		try {
-			const parentFile = parentState.runtime.session.sessionFile;
-			if (!parentFile) return;
-			const parentPath = canonicalSessionPath(parentFile);
-			const edges = (await this.rlmSpawnLedger().edges(true)).filter(
-				(edge) => canonicalSessionPath(edge.parent) === parentPath,
-			);
-			const livePaths = new Set<string>();
-			const edgePaths = new Set<string>();
-			const tombstoned = new Map<string, string>();
-			for (const edge of edges) {
-				const childPath = canonicalSessionPath(edge.child);
-				edgePaths.add(childPath);
-				if (edge.deleted) tombstoned.set(childPath, edge.child);
-				else livePaths.add(childPath);
-			}
-			// Legacy registry entries only decide children without any ledger edge.
-			const legacy = await this.readLegacyRlmSubagentRegistry(
-				this.legacyRlmSubagentRegistryPath(parentFile, parentState.runtime.session.sessionId),
-			);
-			for (const entry of legacy) {
-				const childPath = canonicalSessionPath(entry.sessionFile);
-				if (edgePaths.has(childPath)) continue;
-				if (entry.status === "deleted") tombstoned.set(childPath, entry.sessionFile);
-				else livePaths.add(childPath);
-			}
-			let removed = 0;
-			for (const [childPath, sessionFile] of tombstoned) {
-				if (removed >= AgentDaemon.RLM_ARTIFACT_REAP_LIMIT) break;
-				if (livePaths.has(childPath)) continue;
-				// Degenerate-basename guard, as in deleteSessionArtifacts.
-				if (!basename(sessionFile).replace(/\.jsonl$/, "")) continue;
-				const artifactDir = getSessionArtifactPathForFile(sessionFile);
-				if (!existsSync(artifactDir)) continue;
-				await rm(artifactDir, { recursive: true, force: true });
-				removed++;
-			}
-			if (removed > 0) {
-				this.log(`reaped ${removed} artifact dir(s) of deleted RLM subagents under ${parentPath}`);
-			}
-		} catch (error) {
-			this.log(`RLM subagent artifact reap failed: ${error instanceof Error ? error.message : String(error)}`);
-		}
 	}
 
 	/** Best-effort artifact-dir removal: cache cleanup must never fail a deletion. */

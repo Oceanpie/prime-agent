@@ -1,6 +1,5 @@
 import { EventEmitter } from "node:events";
 import {
-	appendFileSync,
 	chmodSync,
 	existsSync,
 	mkdirSync,
@@ -7471,75 +7470,6 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("reaps tombstoned children's leftover artifact dirs but never live children's", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-reaper-"));
-		try {
-			const fixture = makePersistedRlmDaemonFixture(tempDir);
-			const nestedArtifactsRoot = resolve(fixture.childArtifactDir, "..");
-			// A pre-ledger deleted child only the legacy registry knows about
-			// (appended before first ledger use so seeding sees it; deleted
-			// entries are never seeded as edges).
-			const legacySessionFile = join(fixture.parentArtifactDir, "sub-legacy", "legacy-1.jsonl");
-			appendFileSync(
-				join(fixture.parentArtifactDir, "rlm-subagents.jsonl"),
-				`${JSON.stringify({
-					type: "rlm_subagent",
-					childId: "legacy-1",
-					sessionName: "legacy-worker",
-					sessionDir: join(fixture.parentArtifactDir, "sub-legacy"),
-					sessionFile: legacySessionFile,
-					parentSessionId: fixture.parentSessionId,
-					parentSessionFile: fixture.parentSessionFile,
-					status: "deleted",
-					createdAt: 3,
-					updatedAt: "2026-01-01T00:00:02.000Z",
-				})}\n`,
-			);
-			// Ledger-tombstoned child whose transcript is gone too: its artifact
-			// dir is orphaned garbage.
-			const ledger = new RlmSpawnLedger(tempDir, join(tempDir, "sessions"));
-			const goneSessionFile = join(fixture.parentArtifactDir, "sub-gone", "gone-1.jsonl");
-			await ledger.appendSpawn({
-				childId: "gone-1",
-				parent: fixture.parentSessionFile,
-				child: goneSessionFile,
-				depth: 1,
-				name: "gone-worker",
-			});
-			await ledger.appendDelete({ childId: "gone-1", child: goneSessionFile, reason: "user" });
-			// Live child: latest ledger state is a non-deleted spawn edge.
-			const liveSessionFile = join(fixture.parentArtifactDir, "sub-live", "live-1.jsonl");
-			await ledger.appendSpawn({
-				childId: "live-1",
-				parent: fixture.parentSessionFile,
-				child: liveSessionFile,
-				depth: 1,
-				name: "live-worker",
-			});
-			const artifactDirFor = (id: string) => join(nestedArtifactsRoot, id);
-			for (const id of ["legacy-1", "gone-1", "live-1"]) {
-				mkdirSync(artifactDirFor(id), { recursive: true });
-				writeFileSync(join(artifactDirFor(id), "kernel-state.dill"), "payload");
-			}
-
-			const internals = fixture.daemon as unknown as {
-				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
-				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
-			};
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
-			// Deleting one child opportunistically reaps the parent's other
-			// tombstoned children.
-			await internals.createSubagentRuntimeHost(parentState).deleteRlmSubagentRuntime(fixture.childId);
-
-			expect(existsSync(artifactDirFor("legacy-1"))).toBe(false);
-			expect(existsSync(artifactDirFor("gone-1"))).toBe(false);
-			expect(existsSync(artifactDirFor("live-1"))).toBe(true);
-			expect(existsSync(fixture.childArtifactDir)).toBe(false);
-		} finally {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
-
 	it("still sweeps and resolves when scheduled-job cancellation throws", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-cancel-throw-"));
 		try {
@@ -7593,85 +7523,6 @@ describe("daemon mode helpers", () => {
 			expect(existsSync(fixture.childArtifactDir)).toBe(false);
 			expect(existsSync(fixture.childSessionFile)).toBe(true);
 		} finally {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
-
-	it("never reaps the nested artifacts root for a degenerate recorded sessionFile", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-reaper-degenerate-"));
-		try {
-			const fixture = makePersistedRlmDaemonFixture(tempDir);
-			const nestedArtifactsRoot = resolve(fixture.childArtifactDir, "..");
-			// A tombstoned legacy entry whose sessionFile basename is ".jsonl":
-			// unguarded, its artifact path resolves to the nested artifacts ROOT.
-			appendFileSync(
-				join(fixture.parentArtifactDir, "rlm-subagents.jsonl"),
-				`${JSON.stringify({
-					type: "rlm_subagent",
-					childId: "degenerate-1",
-					sessionName: "degenerate-worker",
-					sessionDir: join(fixture.parentArtifactDir, "sub-degenerate"),
-					sessionFile: join(fixture.parentArtifactDir, "sub-degenerate", ".jsonl"),
-					parentSessionId: fixture.parentSessionId,
-					parentSessionFile: fixture.parentSessionFile,
-					status: "deleted",
-					createdAt: 4,
-					updatedAt: "2026-01-01T00:00:03.000Z",
-				})}\n`,
-			);
-			// A live sibling's artifact dir inside the nested root must survive.
-			expect(existsSync(fixture.childArtifactDir)).toBe(true);
-
-			const internals = fixture.daemon as unknown as {
-				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
-				reapDeletedRlmSubagentArtifacts(parent: ActiveSessionState): Promise<void>;
-			};
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
-			await internals.reapDeletedRlmSubagentArtifacts(parentState);
-
-			expect(existsSync(nestedArtifactsRoot)).toBe(true);
-			expect(existsSync(fixture.childArtifactDir)).toBe(true);
-		} finally {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
-
-	it("bounds artifact reaping per invocation and converges on repeated calls", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-reaper-bound-"));
-		const daemonClass = AgentDaemon as unknown as { RLM_ARTIFACT_REAP_LIMIT: number };
-		const originalLimit = daemonClass.RLM_ARTIFACT_REAP_LIMIT;
-		try {
-			daemonClass.RLM_ARTIFACT_REAP_LIMIT = 2;
-			const fixture = makePersistedRlmDaemonFixture(tempDir);
-			const nestedArtifactsRoot = resolve(fixture.childArtifactDir, "..");
-			const ledger = new RlmSpawnLedger(tempDir, join(tempDir, "sessions"));
-			const ids = ["reap-1", "reap-2", "reap-3"];
-			for (const id of ids) {
-				const sessionFile = join(fixture.parentArtifactDir, `sub-${id}`, `${id}.jsonl`);
-				await ledger.appendSpawn({
-					childId: id,
-					parent: fixture.parentSessionFile,
-					child: sessionFile,
-					depth: 1,
-					name: id,
-				});
-				await ledger.appendDelete({ childId: id, child: sessionFile, reason: "user" });
-				mkdirSync(join(nestedArtifactsRoot, id), { recursive: true });
-			}
-			const internals = fixture.daemon as unknown as {
-				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
-				reapDeletedRlmSubagentArtifacts(parent: ActiveSessionState): Promise<void>;
-			};
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
-
-			await internals.reapDeletedRlmSubagentArtifacts(parentState);
-			const remaining = ids.filter((id) => existsSync(join(nestedArtifactsRoot, id)));
-			expect(remaining).toHaveLength(1);
-
-			await internals.reapDeletedRlmSubagentArtifacts(parentState);
-			expect(ids.filter((id) => existsSync(join(nestedArtifactsRoot, id)))).toHaveLength(0);
-		} finally {
-			daemonClass.RLM_ARTIFACT_REAP_LIMIT = originalLimit;
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
