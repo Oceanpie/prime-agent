@@ -14,9 +14,11 @@ export interface DeleteSessionFileOptions {
  * Permanently remove a session's artifact directory (durable schedule state,
  * kernel snapshot, RLM scratch files, …), which lives at
  * `<dirname(sessionDir)>/session-artifacts/<id>`.
- * Only invoked on delete, never on deactivation.
+ * Only invoked on delete, never on deactivation. The deletion boundary:
+ * transcript + display file are the durable record and are retained; the
+ * nested artifact dir is a runtime cache and is dropped on delete.
  */
-async function deleteSessionArtifacts(sessionPath: string): Promise<void> {
+export async function deleteSessionArtifacts(sessionPath: string): Promise<void> {
 	// A degenerate name (".jsonl") would resolve to the artifacts root itself.
 	if (!basename(sessionPath).replace(/\.jsonl$/, "")) return;
 	await rm(getSessionArtifactPathForFile(sessionPath), { recursive: true, force: true });

@@ -96,7 +96,7 @@ import {
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
-import { deleteSessionFile } from "../../core/session-file-actions.js";
+import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
@@ -1089,6 +1089,11 @@ export class AgentDaemon {
 		} else if (edges.length > 0) {
 			// Only a tombstoned edge: the topology tombstone is already durable
 			// (the display tombstone was written before it), nothing to re-append.
+			// A prior deletion may have crashed between the tombstone writes and
+			// the artifact sweep, so a retry heals the cache here: the transcript
+			// and display tombstone stay (durable record), the nested artifact
+			// dir goes (runtime cache).
+			await this.deleteRlmSubagentArtifacts(childId, edges[0].child);
 			return;
 		} else {
 			// No edge at all. A pre-ledger child the seed missed may still exist
@@ -1144,6 +1149,28 @@ export class AgentDaemon {
 		// dual-write era it has no other writer to fall back on, so a failed
 		// append is a failed deletion.
 		await this.rlmSpawnLedger().appendDelete({ childId, child: entry.sessionFile, reason });
+		// Deleted subagents are DELETED: kernel snapshots and harness state go
+		// with them. Only the transcript and the display-file tombstone remain
+		// ("deletion keeps the transcript readable"). Both tombstone writes are
+		// durable at this point, so dropping the runtime cache is safe — and
+		// best-effort: a deletion must never fail over cache cleanup.
+		await this.deleteRlmSubagentArtifacts(childId, entry.sessionFile);
+	}
+
+	/**
+	 * Best-effort removal of a deleted child's nested artifact dir
+	 * (`session-artifacts/<childId's session id>/` next to its transcript):
+	 * kernel snapshots + harness state. Never throws — cache cleanup must not
+	 * fail a deletion whose tombstones are already durable.
+	 */
+	private async deleteRlmSubagentArtifacts(childId: string, childSessionFile: string): Promise<void> {
+		try {
+			await deleteSessionArtifacts(childSessionFile);
+		} catch (error) {
+			this.log(
+				`failed to remove artifact dir for deleted RLM subagent ${childId}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 
 	/**
