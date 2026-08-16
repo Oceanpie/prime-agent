@@ -2593,9 +2593,16 @@ export class AgentDaemon {
 					// kernel dispose's final snapshot flush may have already happened,
 					// resurrecting the artifact dir swept in recordRlmSubagentDeletion.
 					// A killed close can join a passivation close that already skipped
-					// killed cleanup. The sweep never throws.
+					// killed cleanup. Neither step may throw here: a jobs-store error
+					// would mask the teardown error and skip the sweep.
 					if (childSessionFile) {
-						this.cancelScheduledJobsForSessionFile(childSessionFile);
+						try {
+							this.cancelScheduledJobsForSessionFile(childSessionFile);
+						} catch (error) {
+							this.log(
+								`failed to cancel scheduled jobs for deleted RLM subagent ${childId}: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
 						await this.deleteRlmSubagentArtifacts(childId, childSessionFile);
 					}
 				}

@@ -7540,6 +7540,32 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("still sweeps and resolves when scheduled-job cancellation throws", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-cancel-throw-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			writeFileSync(join(fixture.childArtifactDir, "kernel-state.dill"), "payload");
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				cancelScheduledJobsForSessionFile(sessionFile: string): void;
+			};
+			internals.cancelScheduledJobsForSessionFile = vi.fn(() => {
+				throw new Error("corrupt scheduled-jobs.json");
+			});
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+
+			// Jobs-store bookkeeping must not fail the deletion or skip the sweep.
+			await internals.createSubagentRuntimeHost(parentState).deleteRlmSubagentRuntime(fixture.childId);
+
+			expect(internals.cancelScheduledJobsForSessionFile).toHaveBeenCalledOnce();
+			expect(existsSync(fixture.childArtifactDir)).toBe(false);
+			expect(existsSync(fixture.childSessionFile)).toBe(true);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("sweeps the artifact dir even when child teardown throws", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-teardown-throw-"));
 		try {
