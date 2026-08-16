@@ -2552,6 +2552,15 @@ export class AgentDaemon {
 				} else {
 					await runtime.session.disposeAsync();
 				}
+				if (status === "cancelled" && deletionError === undefined) {
+					// Re-sweep after teardown: the runtime's kernel dispose flushes a
+					// final snapshot that would resurrect the artifact dir swept
+					// inside recordRlmSubagentDeletion.
+					const childSessionFile = runtime.session?.sessionFile;
+					if (childSessionFile) {
+						await this.deleteRlmSubagentArtifacts(options.id, childSessionFile);
+					}
+				}
 				if (deletionError !== undefined) throw deletionError;
 			},
 			deleteRlmSubagentRuntime: async (childId, session) => {
@@ -2592,7 +2601,8 @@ export class AgentDaemon {
 				const childSessionFile =
 					persisted?.sessionFile ?? state?.runtime.session.sessionFile ?? legacyFallback?.sessionFile;
 				// Persist the deletion boundary before tearing down the runtime. As with a
-				// resident child, deletion keeps its transcript and artifact tree on disk.
+				// resident child, deletion keeps the transcript readable; the nested
+				// artifact dir (runtime cache) is swept inside the record call.
 				await this.recordRlmSubagentDeletion(parentState, childId);
 				const staleSession = state && session && state.runtime.session !== session ? session : undefined;
 				try {
@@ -2607,6 +2617,11 @@ export class AgentDaemon {
 				// A killed close can join a passivation close that already skipped killed cleanup.
 				if (childSessionFile) {
 					this.cancelScheduledJobsForSessionFile(childSessionFile);
+					// Re-sweep after teardown: a resident child's kernel dispose
+					// flushes a final snapshot and job cancellation can rewrite
+					// scheduled-jobs.json, both of which would resurrect the
+					// artifact dir swept inside recordRlmSubagentDeletion.
+					await this.deleteRlmSubagentArtifacts(childId, childSessionFile);
 				}
 			},
 			disposeRlmSubagentRuntimes: async () => {
