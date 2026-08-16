@@ -118,6 +118,62 @@ class DaemonShutdownAdmissionError extends Error {
 	}
 }
 
+/**
+ * Owns a lease-renew loop safely: the unref()'d interval, single-flight
+ * refresh dedup shared by timer-fired and direct calls, and lost-state fencing.
+ */
+class RenewableRegistryRecord {
+	private stopped = false;
+	private lost = false;
+	private refreshPromise?: Promise<void>;
+	private readonly refreshTimer: ReturnType<typeof setInterval>;
+
+	constructor(
+		private readonly registryDir: string,
+		refreshMs: number,
+		private readonly renewUnderGuard: () => void,
+		private readonly createLostError: () => Error,
+	) {
+		this.refreshTimer = setInterval(() => {
+			void this.assertOrRenew().catch(() => undefined);
+		}, refreshMs);
+		this.refreshTimer.unref();
+	}
+
+	async assertOrRenew(): Promise<void> {
+		if (this.stopped || this.lost) {
+			throw this.createLostError();
+		}
+		this.refreshPromise ??= this.performRenew().finally(() => {
+			this.refreshPromise = undefined;
+		});
+		await this.refreshPromise;
+	}
+
+	private async performRenew(): Promise<void> {
+		try {
+			await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
+				// stop() may have completed while this call waited on the guard;
+				// a stopped record must never be rewritten to disk.
+				if (this.stopped || this.lost) {
+					throw this.createLostError();
+				}
+				this.renewUnderGuard();
+			});
+		} catch (error) {
+			this.lost = true;
+			clearInterval(this.refreshTimer);
+			throw error;
+		}
+	}
+
+	async stop(): Promise<void> {
+		this.stopped = true;
+		clearInterval(this.refreshTimer);
+		await this.refreshPromise?.catch(() => undefined);
+	}
+}
+
 class DaemonSupervisorOwnership {
 	private released = false;
 
@@ -181,52 +237,44 @@ class DaemonSupervisorOwnership {
 
 class DaemonShutdownAdmission {
 	private released = false;
-	private lost = false;
-	private refreshPromise?: Promise<void>;
-	private readonly refreshTimer: ReturnType<typeof setInterval>;
+	private readonly renewal: RenewableRegistryRecord;
 
 	constructor(
 		private readonly record: DaemonShutdownAdmissionRecord,
 		private readonly registryDir: string,
 	) {
-		this.refreshTimer = setInterval(() => {
-			this.refreshPromise ??= this.assertOrRenew()
-				.catch(() => undefined)
-				.finally(() => {
-					this.refreshPromise = undefined;
-				});
-		}, SHUTDOWN_ADMISSION_REFRESH_MS);
-		this.refreshTimer.unref();
+		this.renewal = new RenewableRegistryRecord(
+			registryDir,
+			SHUTDOWN_ADMISSION_REFRESH_MS,
+			() => this.renewUnderGuard(),
+			() => new DaemonShutdownAdmissionError("Daemon shutdown admission was lost"),
+		);
 	}
 
 	async assertOrRenew(): Promise<void> {
-		if (this.released || this.lost) {
+		if (this.released) {
 			throw new DaemonShutdownAdmissionError("Daemon shutdown admission was lost");
 		}
-		try {
-			await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
-				const path = shutdownAdmissionPath(this.registryDir);
-				const current = readShutdownAdmission(path);
-				if (
-					!current ||
-					current.token !== this.record.token ||
-					current.pid !== this.record.pid ||
-					current.processStartId !== this.record.processStartId ||
-					Date.parse(current.expiresAt) <= Date.now() ||
-					!matchesExactProcessIdentity(this.record)
-				) {
-					throw new DaemonShutdownAdmissionError("Daemon shutdown admission was lost");
-				}
-				const now = Date.now();
-				this.record.updatedAt = new Date(now).toISOString();
-				this.record.expiresAt = new Date(now + SHUTDOWN_ADMISSION_LEASE_MS).toISOString();
-				writeJsonAtomically(path, this.record);
-			});
-		} catch (error) {
-			this.lost = true;
-			clearInterval(this.refreshTimer);
-			throw error;
+		await this.renewal.assertOrRenew();
+	}
+
+	private renewUnderGuard(): void {
+		const path = shutdownAdmissionPath(this.registryDir);
+		const current = readShutdownAdmission(path);
+		if (
+			!current ||
+			current.token !== this.record.token ||
+			current.pid !== this.record.pid ||
+			current.processStartId !== this.record.processStartId ||
+			Date.parse(current.expiresAt) <= Date.now() ||
+			!matchesExactProcessIdentity(this.record)
+		) {
+			throw new DaemonShutdownAdmissionError("Daemon shutdown admission was lost");
 		}
+		const now = Date.now();
+		this.record.updatedAt = new Date(now).toISOString();
+		this.record.expiresAt = new Date(now + SHUTDOWN_ADMISSION_LEASE_MS).toISOString();
+		writeJsonAtomically(path, this.record);
 	}
 
 	async release(): Promise<void> {
@@ -234,8 +282,7 @@ class DaemonShutdownAdmission {
 			return;
 		}
 		this.released = true;
-		clearInterval(this.refreshTimer);
-		await this.refreshPromise;
+		await this.renewal.stop();
 		await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
 			const path = shutdownAdmissionPath(this.registryDir);
 			const current = readShutdownAdmission(path);
