@@ -7414,6 +7414,8 @@ describe("daemon mode helpers", () => {
 			// Runtime cache gone; transcript + display tombstone (durable record) stay.
 			expect(existsSync(fixture.childArtifactDir)).toBe(false);
 			expect(existsSync(fixture.childSessionFile)).toBe(true);
+			// Depth-2 boundary: deleting a child never touches descendant transcripts.
+			expect(existsSync(fixture.grandchildSessionFile)).toBe(true);
 			const display = JSON.parse(readFileSync(join(fixture.childSessionDir, "rlm-subagent.json"), "utf8")) as {
 				status: string;
 			};
@@ -7432,7 +7434,8 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("does not fail a deletion when the artifact dir cannot be removed", async () => {
+	// chmod-based read-only dirs don't block root, so skip when running as uid 0.
+	it.skipIf(process.getuid?.() === 0)("does not fail a deletion when the artifact dir cannot be removed", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-rm-failure-"));
 		let lockedRoot: string | undefined;
 		try {
@@ -7532,6 +7535,45 @@ describe("daemon mode helpers", () => {
 			expect(existsSync(artifactDirFor("gone-1"))).toBe(false);
 			expect(existsSync(artifactDirFor("live-1"))).toBe(true);
 			expect(existsSync(fixture.childArtifactDir)).toBe(false);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("never reaps the nested artifacts root for a degenerate recorded sessionFile", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-reaper-degenerate-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const nestedArtifactsRoot = resolve(fixture.childArtifactDir, "..");
+			// A tombstoned legacy entry whose sessionFile basename is ".jsonl":
+			// unguarded, its artifact path resolves to the nested artifacts ROOT.
+			appendFileSync(
+				join(fixture.parentArtifactDir, "rlm-subagents.jsonl"),
+				`${JSON.stringify({
+					type: "rlm_subagent",
+					childId: "degenerate-1",
+					sessionName: "degenerate-worker",
+					sessionDir: join(fixture.parentArtifactDir, "sub-degenerate"),
+					sessionFile: join(fixture.parentArtifactDir, "sub-degenerate", ".jsonl"),
+					parentSessionId: fixture.parentSessionId,
+					parentSessionFile: fixture.parentSessionFile,
+					status: "deleted",
+					createdAt: 4,
+					updatedAt: "2026-01-01T00:00:03.000Z",
+				})}\n`,
+			);
+			// A live sibling's artifact dir inside the nested root must survive.
+			expect(existsSync(fixture.childArtifactDir)).toBe(true);
+
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				reapDeletedRlmSubagentArtifacts(parent: ActiveSessionState): Promise<void>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals.reapDeletedRlmSubagentArtifacts(parentState);
+
+			expect(existsSync(nestedArtifactsRoot)).toBe(true);
+			expect(existsSync(fixture.childArtifactDir)).toBe(true);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

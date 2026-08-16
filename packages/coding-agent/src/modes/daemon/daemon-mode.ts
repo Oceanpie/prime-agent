@@ -11,7 +11,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, rm, stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -1094,8 +1094,11 @@ export class AgentDaemon {
 			// A prior deletion may have crashed between the tombstone writes and
 			// the artifact sweep, so a retry heals the cache here: the transcript
 			// and display tombstone stay (durable record), the nested artifact
-			// dir goes (runtime cache).
-			await this.deleteRlmSubagentArtifacts(childId, edges[0].child);
+			// dir goes (runtime cache). A childId deleted twice at different
+			// paths leaves multiple tombstoned edges — sweep them all.
+			for (const tombstoned of edges) {
+				await this.deleteRlmSubagentArtifacts(childId, tombstoned.child);
+			}
 			return;
 		} else {
 			// No edge at all. A pre-ledger child the seed missed may still exist
@@ -1217,6 +1220,11 @@ export class AgentDaemon {
 			for (const [childPath, sessionFile] of tombstoned) {
 				if (removed >= AgentDaemon.RLM_ARTIFACT_REAP_LIMIT) break;
 				if (livePaths.has(childPath)) continue;
+				// Same degenerate case deleteSessionArtifacts guards: a recorded
+				// sessionFile whose basename is ".jsonl" (or empty) would resolve
+				// to the nested artifacts ROOT — removing it would wipe every
+				// sibling's artifact dir, live children included.
+				if (!basename(sessionFile).replace(/\.jsonl$/, "")) continue;
 				const artifactDir = getSessionArtifactPathForFile(sessionFile);
 				if (!existsSync(artifactDir)) continue;
 				await rm(artifactDir, { recursive: true, force: true });
