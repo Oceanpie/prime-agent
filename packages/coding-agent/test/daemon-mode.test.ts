@@ -7540,6 +7540,37 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("sweeps the artifact dir even when child teardown throws", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-teardown-throw-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			// A dispose that flushes a fresh kernel snapshot (recreating the
+			// artifact dir) and then fails.
+			const throwingSession = {
+				disposeAsync: vi.fn(async () => {
+					mkdirSync(fixture.childArtifactDir, { recursive: true });
+					writeFileSync(join(fixture.childArtifactDir, "kernel-state.dill"), "flushed");
+					throw new Error("dispose failed");
+				}),
+			} as unknown as ActiveSessionState["runtime"]["session"];
+
+			await expect(
+				internals.createSubagentRuntimeHost(parentState).deleteRlmSubagentRuntime(fixture.childId, throwingSession),
+			).rejects.toThrow("dispose failed");
+
+			expect(throwingSession.disposeAsync).toHaveBeenCalledOnce();
+			expect(existsSync(fixture.childArtifactDir)).toBe(false);
+			expect(existsSync(fixture.childSessionFile)).toBe(true);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("never reaps the nested artifacts root for a degenerate recorded sessionFile", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-reaper-degenerate-"));
 		try {

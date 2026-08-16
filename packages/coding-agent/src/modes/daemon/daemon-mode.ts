@@ -2520,16 +2520,20 @@ export class AgentDaemon {
 						candidate.runtime.metadata.rlmChildId === options.id &&
 						candidate.runtime.session === runtime.session,
 				);
-				if (state) {
-					await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
-				} else {
-					await runtime.session.disposeAsync();
-				}
-				if (status === "cancelled" && deletionError === undefined) {
-					// Re-sweep after teardown (see deleteRlmSubagentRuntime).
-					const childSessionFile = runtime.session?.sessionFile;
-					if (childSessionFile) {
-						await this.deleteRlmSubagentArtifacts(options.id, childSessionFile);
+				try {
+					if (state) {
+						await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
+					} else {
+						await runtime.session.disposeAsync();
+					}
+				} finally {
+					// Sweep even when teardown throws (see deleteRlmSubagentRuntime);
+					// never throws, so it cannot mask a teardown error.
+					if (status === "cancelled" && deletionError === undefined) {
+						const childSessionFile = runtime.session?.sessionFile;
+						if (childSessionFile) {
+							await this.deleteRlmSubagentArtifacts(options.id, childSessionFile);
+						}
 					}
 				}
 				if (deletionError !== undefined) throw deletionError;
@@ -2575,20 +2579,25 @@ export class AgentDaemon {
 				await this.recordRlmSubagentDeletion(parentState, childId);
 				const staleSession = state && session && state.runtime.session !== session ? session : undefined;
 				try {
-					if (state) {
-						await this.closeSession(state, "killed", false);
-					} else {
-						await session?.disposeAsync();
+					try {
+						if (state) {
+							await this.closeSession(state, "killed", false);
+						} else {
+							await session?.disposeAsync();
+						}
+					} finally {
+						await staleSession?.disposeAsync();
 					}
 				} finally {
-					await staleSession?.disposeAsync();
-				}
-				// A killed close can join a passivation close that already skipped killed cleanup.
-				if (childSessionFile) {
-					this.cancelScheduledJobsForSessionFile(childSessionFile);
-					// Re-sweep: kernel dispose flushes a final snapshot that would
-					// resurrect the artifact dir swept in recordRlmSubagentDeletion.
-					await this.deleteRlmSubagentArtifacts(childId, childSessionFile);
+					// Runs even when teardown throws: the jobs-cancel rewrite and the
+					// kernel dispose's final snapshot flush may have already happened,
+					// resurrecting the artifact dir swept in recordRlmSubagentDeletion.
+					// A killed close can join a passivation close that already skipped
+					// killed cleanup. The sweep never throws.
+					if (childSessionFile) {
+						this.cancelScheduledJobsForSessionFile(childSessionFile);
+						await this.deleteRlmSubagentArtifacts(childId, childSessionFile);
+					}
 				}
 			},
 			disposeRlmSubagentRuntimes: async () => {
