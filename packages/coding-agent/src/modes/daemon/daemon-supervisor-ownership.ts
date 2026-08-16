@@ -548,7 +548,11 @@ export async function persistDaemonStartupFenceFromOwner(
 		});
 		let matchingOwners = owners.filter((owner) => owner.socketPath === normalizedSocketPath);
 		if (matchingOwners.length === 0 && legacyRegistryDir) {
-			matchingOwners = readLegacyOwnersForSocket(legacyRegistryDir, normalizedSocketPath);
+			// Stale legacy leftovers are expected; keep only records matching the
+			// identity the caller already holds.
+			matchingOwners = readLegacyOwnersForSocket(legacyRegistryDir, normalizedSocketPath).filter(
+				(owner) => owner.token === hello.supervisorOwnerToken && owner.pid === hello.supervisorPid,
+			);
 		}
 		if (matchingOwners.length === 0) {
 			throw new Error(`Daemon supervisor owner does not match ${socketPath}`);

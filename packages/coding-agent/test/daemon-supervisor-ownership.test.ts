@@ -7,6 +7,7 @@ import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	acquireDaemonShutdownAdmission,
 	acquireDaemonSupervisorOwnership,
+	assertDaemonSupervisorOwnerCurrent,
 	persistDaemonStartupFenceFromOwner,
 } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 
@@ -87,7 +88,7 @@ describe("daemon supervisor ownership registry", () => {
 			socketPath: paths.socketPath,
 		});
 		const record = legacyOwner.record;
-		if (!record.processStartId) return;
+		expect(record.processStartId).toBeDefined();
 		const hello = {
 			supervisorGeneration: record.generation,
 			supervisorOwnerToken: record.token,
@@ -109,6 +110,36 @@ describe("daemon supervisor ownership registry", () => {
 		await expect(persistDaemonStartupFenceFromOwner(paths.socketPath, hello, paths.registryDir)).rejects.toThrow(
 			/does not match/,
 		);
+		await legacyOwner.release();
+	});
+
+	it("validates a pre-move owner claim through the legacy registry", async () => {
+		const paths = createPaths();
+		const legacyDir = join(paths.root, "legacy-registry");
+		const legacyOwner = await acquireDaemonSupervisorOwnership({
+			agentDir: paths.agentDir,
+			appVersion: "test",
+			descriptorDir: paths.descriptorDir,
+			generation: "legacy-claim-owner",
+			registryDir: legacyDir,
+			socketPath: paths.socketPath,
+		});
+		const identity = {
+			generation: legacyOwner.record.generation,
+			pid: legacyOwner.record.pid,
+			...(legacyOwner.record.processStartId ? { processStartId: legacyOwner.record.processStartId } : {}),
+			socketPath: legacyOwner.record.socketPath,
+		};
+		mkdirSync(paths.registryDir, { recursive: true });
+
+		await expect(
+			assertDaemonSupervisorOwnerCurrent(identity, undefined, paths.registryDir, legacyDir),
+		).resolves.toEqual(expect.any(String));
+
+		// Without the injected legacy dir, an explicit registry never falls back.
+		await expect(assertDaemonSupervisorOwnerCurrent(identity, undefined, paths.registryDir)).rejects.toMatchObject({
+			code: "supervisor_generation_stale",
+		});
 		await legacyOwner.release();
 	});
 
