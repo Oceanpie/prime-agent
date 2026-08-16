@@ -1,9 +1,11 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it } from "vitest";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
+	acquireDaemonShutdownAdmission,
 	acquireDaemonSupervisorOwnership,
 	defaultDaemonSupervisorRegistryDir,
 } from "../src/modes/daemon/daemon-supervisor-ownership.js";
@@ -18,9 +20,15 @@ interface OwnerRecord {
 }
 
 const registryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
+const previousRegistryDirEnv = process.env[registryDirEnv];
 const cleanupDirs: string[] = [];
 
 afterEach(() => {
+	if (previousRegistryDirEnv === undefined) {
+		delete process.env[registryDirEnv];
+	} else {
+		process.env[registryDirEnv] = previousRegistryDirEnv;
+	}
 	while (cleanupDirs.length > 0) {
 		const dir = cleanupDirs.pop();
 		if (dir) rmSync(dir, { recursive: true, force: true });
@@ -94,6 +102,27 @@ describe("daemon supervisor ownership registry", () => {
 		await expect(reaped.assertCurrent()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
 		expect(existsSync(reapedDir)).toBe(false);
 		await reaped.release();
+	});
+
+	it("does not resurrect the shutdown admission when release overtakes an in-flight renew", async () => {
+		const paths = createPaths();
+		mkdirSync(paths.registryDir, { recursive: true, mode: 0o700 });
+		process.env[registryDirEnv] = paths.registryDir;
+		const admission = await acquireDaemonShutdownAdmission();
+		const admissionPath = join(paths.registryDir, "shutdown-admission.json");
+		expect(existsSync(admissionPath)).toBe(true);
+		const dropGuard = await lockfile.lock(paths.registryDir, {
+			realpath: false,
+			lockfilePath: join(paths.registryDir, ".guard"),
+		});
+		// The direct renew is now queued behind the held guard.
+		const pending = admission.assertOrRenew();
+		pending.catch(() => undefined);
+		const releasing = admission.release();
+		await dropGuard();
+		await expect(pending).rejects.toMatchObject({ code: "daemon_shutdown_in_progress" });
+		await releasing;
+		expect(existsSync(admissionPath)).toBe(false);
 	});
 
 	it("disambiguates never-acquired from lost-on-disk ownership errors", async () => {
