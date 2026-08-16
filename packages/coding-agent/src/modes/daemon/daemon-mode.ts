@@ -1089,13 +1089,9 @@ export class AgentDaemon {
 				sessionFile: parentFile,
 			});
 		} else if (edges.length > 0) {
-			// Only a tombstoned edge: the topology tombstone is already durable
-			// (the display tombstone was written before it), nothing to re-append.
-			// A prior deletion may have crashed between the tombstone writes and
-			// the artifact sweep, so a retry heals the cache here: the transcript
-			// and display tombstone stay (durable record), the nested artifact
-			// dir goes (runtime cache). A childId deleted twice at different
-			// paths leaves multiple tombstoned edges — sweep them all.
+			// Only tombstoned edges: the tombstones are already durable, nothing
+			// to re-append. A prior deletion may have crashed before its artifact
+			// sweep, so retry it here.
 			for (const tombstoned of edges) {
 				await this.deleteRlmSubagentArtifacts(childId, tombstoned.child);
 			}
@@ -1154,37 +1150,17 @@ export class AgentDaemon {
 		// dual-write era it has no other writer to fall back on, so a failed
 		// append is a failed deletion.
 		await this.rlmSpawnLedger().appendDelete({ childId, child: entry.sessionFile, reason });
-		// Deleted subagents are DELETED: kernel snapshots and harness state go
-		// with them. Only the transcript and the display-file tombstone remain
-		// ("deletion keeps the transcript readable"). Both tombstone writes are
-		// durable at this point, so dropping the runtime cache is safe — and
-		// best-effort: a deletion must never fail over cache cleanup.
+		// Deletion boundary: transcript + display tombstone are the durable
+		// record and stay; the nested artifact dir is a runtime cache and goes.
 		await this.deleteRlmSubagentArtifacts(childId, entry.sessionFile);
-		// Each deletion also opportunistically reaps artifact dirs left behind
-		// by this parent's previously tombstoned children (pre-cleanup builds
-		// never removed them). Bounded per call; converges over deletions.
 		await this.reapDeletedRlmSubagentArtifacts(parentState);
 	}
 
 	/**
-	 * Opportunistic, bounded reaper for THIS parent's already-tombstoned
-	 * children whose nested artifact dirs (kernel snapshots + harness state)
-	 * were left behind by builds that never removed them on deletion.
-	 *
-	 * SAFETY: a child's spawn record is appended to the ledger — and awaited
-	 * at admission — BEFORE any of its artifacts exist, so a live child always
-	 * has a non-deleted edge by the time its artifact dir appears. The reaper
-	 * therefore only acts on children whose LATEST ledger state is deleted
-	 * (or, for pre-ledger children with no edge at all, whose legacy registry
-	 * state is "deleted"), and never touches a path a live edge still claims.
-	 * Tombstoned children are reaped whether or not their transcript still
-	 * exists: with the transcript gone the artifact dir is orphaned garbage,
-	 * and with it present only the runtime cache goes — the transcript and
-	 * display tombstone are the durable record and stay.
-	 *
-	 * Best-effort and bounded (at most {@link AgentDaemon.RLM_ARTIFACT_REAP_LIMIT}
-	 * removals per invocation) so a single deletion never absorbs an unbounded
-	 * cleanup; repeated deletions converge on a clean tree.
+	 * Reap leftover artifact dirs of this parent's tombstoned children, capped
+	 * at {@link AgentDaemon.RLM_ARTIFACT_REAP_LIMIT} removals per call. Safe
+	 * because a spawn record is awaited at admission before any artifacts
+	 * exist, so a live child always has a non-deleted edge here.
 	 */
 	private async reapDeletedRlmSubagentArtifacts(parentState: ActiveSessionState): Promise<void> {
 		try {
@@ -1196,7 +1172,6 @@ export class AgentDaemon {
 			);
 			const livePaths = new Set<string>();
 			const edgePaths = new Set<string>();
-			// Recorded (writer-shaped) sessionFile per tombstoned canonical path.
 			const tombstoned = new Map<string, string>();
 			for (const edge of edges) {
 				const childPath = canonicalSessionPath(edge.child);
@@ -1204,9 +1179,7 @@ export class AgentDaemon {
 				if (edge.deleted) tombstoned.set(childPath, edge.child);
 				else livePaths.add(childPath);
 			}
-			// Legacy registry entries only decide children the ledger has no edge
-			// for (pre-ledger children the seed missed); for everyone else the
-			// ledger's latest state is authoritative.
+			// Legacy registry entries only decide children without any ledger edge.
 			const legacy = await this.readLegacyRlmSubagentRegistry(
 				this.legacyRlmSubagentRegistryPath(parentFile, parentState.runtime.session.sessionId),
 			);
@@ -1220,10 +1193,7 @@ export class AgentDaemon {
 			for (const [childPath, sessionFile] of tombstoned) {
 				if (removed >= AgentDaemon.RLM_ARTIFACT_REAP_LIMIT) break;
 				if (livePaths.has(childPath)) continue;
-				// Same degenerate case deleteSessionArtifacts guards: a recorded
-				// sessionFile whose basename is ".jsonl" (or empty) would resolve
-				// to the nested artifacts ROOT — removing it would wipe every
-				// sibling's artifact dir, live children included.
+				// Degenerate-basename guard, as in deleteSessionArtifacts.
 				if (!basename(sessionFile).replace(/\.jsonl$/, "")) continue;
 				const artifactDir = getSessionArtifactPathForFile(sessionFile);
 				if (!existsSync(artifactDir)) continue;
@@ -1238,12 +1208,7 @@ export class AgentDaemon {
 		}
 	}
 
-	/**
-	 * Best-effort removal of a deleted child's nested artifact dir
-	 * (`session-artifacts/<childId's session id>/` next to its transcript):
-	 * kernel snapshots + harness state. Never throws — cache cleanup must not
-	 * fail a deletion whose tombstones are already durable.
-	 */
+	/** Best-effort artifact-dir removal: cache cleanup must never fail a deletion. */
 	private async deleteRlmSubagentArtifacts(childId: string, childSessionFile: string): Promise<void> {
 		try {
 			await deleteSessionArtifacts(childSessionFile);
@@ -2561,9 +2526,7 @@ export class AgentDaemon {
 					await runtime.session.disposeAsync();
 				}
 				if (status === "cancelled" && deletionError === undefined) {
-					// Re-sweep after teardown: the runtime's kernel dispose flushes a
-					// final snapshot that would resurrect the artifact dir swept
-					// inside recordRlmSubagentDeletion.
+					// Re-sweep after teardown (see deleteRlmSubagentRuntime).
 					const childSessionFile = runtime.session?.sessionFile;
 					if (childSessionFile) {
 						await this.deleteRlmSubagentArtifacts(options.id, childSessionFile);
@@ -2608,9 +2571,7 @@ export class AgentDaemon {
 						: undefined;
 				const childSessionFile =
 					persisted?.sessionFile ?? state?.runtime.session.sessionFile ?? legacyFallback?.sessionFile;
-				// Persist the deletion boundary before tearing down the runtime. As with a
-				// resident child, deletion keeps the transcript readable; the nested
-				// artifact dir (runtime cache) is swept inside the record call.
+				// Persist the deletion boundary before tearing down the runtime.
 				await this.recordRlmSubagentDeletion(parentState, childId);
 				const staleSession = state && session && state.runtime.session !== session ? session : undefined;
 				try {
@@ -2625,10 +2586,8 @@ export class AgentDaemon {
 				// A killed close can join a passivation close that already skipped killed cleanup.
 				if (childSessionFile) {
 					this.cancelScheduledJobsForSessionFile(childSessionFile);
-					// Re-sweep after teardown: a resident child's kernel dispose
-					// flushes a final snapshot and job cancellation can rewrite
-					// scheduled-jobs.json, both of which would resurrect the
-					// artifact dir swept inside recordRlmSubagentDeletion.
+					// Re-sweep: kernel dispose flushes a final snapshot that would
+					// resurrect the artifact dir swept in recordRlmSubagentDeletion.
 					await this.deleteRlmSubagentArtifacts(childId, childSessionFile);
 				}
 			},

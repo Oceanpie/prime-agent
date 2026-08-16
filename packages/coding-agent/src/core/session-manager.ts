@@ -343,11 +343,7 @@ function createUniqueSessionFileTarget(sessionDir: string): { sessionId: string;
 	throw new Error("Unable to create a unique session file");
 }
 
-/**
- * Root of the artifact tree that sits next to a sessions dir:
- * `<dirname(sessionDir)>/session-artifacts`. Canonical home for the layout —
- * every artifact-path derivation must go through this helper family.
- */
+/** Root of the artifact tree next to a sessions dir: `<dirname(sessionDir)>/session-artifacts`. */
 export function getSessionArtifactsRoot(sessionDir: string): string {
 	return join(dirname(sessionDir), "session-artifacts");
 }
@@ -357,11 +353,7 @@ export function getSessionArtifactPath(sessionDir: string, sessionId: string): s
 	return join(getSessionArtifactsRoot(sessionDir), sessionId);
 }
 
-/**
- * sessionFile-shaped convenience for {@link getSessionArtifactPath}. The id
- * defaults to the file's basename minus `.jsonl`; pass an explicit id when it
- * differs (e.g. a header id or a root session id).
- */
+/** {@link getSessionArtifactPath} from a session file; the id defaults to basename minus `.jsonl`. */
 export function getSessionArtifactPathForFile(sessionFile: string, sessionId?: string): string {
 	return getSessionArtifactPath(dirname(sessionFile), sessionId ?? basename(sessionFile).replace(/\.jsonl$/, ""));
 }
