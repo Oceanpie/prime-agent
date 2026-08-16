@@ -99,6 +99,7 @@ import {
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
 import {
+	getSessionArtifactPathForFile,
 	readSessionInfo,
 	resolveSessionRlmDepth,
 	type SessionInfo,
@@ -953,12 +954,7 @@ export class AgentDaemon {
 	 * ledger seed source has its own equivalent reader).
 	 */
 	private legacyRlmSubagentRegistryPath(parentSessionFile: string, parentSessionId: string): string {
-		return join(
-			dirname(dirname(parentSessionFile)),
-			"session-artifacts",
-			parentSessionId,
-			RLM_SUBAGENT_REGISTRY_FILE,
-		);
+		return join(getSessionArtifactPathForFile(parentSessionFile, parentSessionId), RLM_SUBAGENT_REGISTRY_FILE);
 	}
 
 	private async readLegacyRlmSubagentRegistry(
