@@ -103,8 +103,16 @@ class DaemonSupervisorAlreadyRunningError extends Error {
 class DaemonSupervisorOwnershipLostError extends Error {
 	readonly code = "supervisor_generation_stale" as const;
 
-	constructor(generation: string) {
-		super(`Daemon supervisor generation ${generation} no longer owns its registry entry`);
+	constructor(generation: string, details: { socketPath?: string; registryDir?: string } = {}) {
+		const context = [
+			details.socketPath ? `socket: ${details.socketPath}` : undefined,
+			details.registryDir ? `registry: ${details.registryDir}` : undefined,
+		].filter((part) => part !== undefined);
+		super(
+			`Daemon supervisor generation ${generation} no longer owns its registry entry ` +
+				`(record on disk is missing or was replaced)${context.length > 0 ? `; ${context.join("; ")}` : ""}; ` +
+				"restart the daemon to recover — sessions are preserved",
+		);
 		this.name = "DaemonSupervisorOwnershipLostError";
 	}
 }
@@ -185,12 +193,19 @@ class DaemonSupervisorOwnership {
 
 	async assertCurrent(): Promise<void> {
 		if (this.released) {
-			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+			throw this.ownershipLostError();
 		}
 		const current = readOwnerRecord(this.ownerDirectory);
 		if (!current || !sameOwnerRecord(current, this.record)) {
-			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+			throw this.ownershipLostError();
 		}
+	}
+
+	private ownershipLostError(): DaemonSupervisorOwnershipLostError {
+		return new DaemonSupervisorOwnershipLostError(this.record.generation, {
+			socketPath: this.record.socketPath,
+			registryDir: this.registryDir,
+		});
 	}
 
 	async updatePhase(phase: DaemonSupervisorOwnerPhase): Promise<void> {
@@ -433,11 +448,11 @@ export async function assertDaemonSupervisorOwnerCurrent(
 		current.socketPath !== normalizeSocketPath(owner.socketPath) ||
 		!isProcessAlive(current.pid)
 	) {
-		throw new DaemonSupervisorOwnershipLostError(owner.generation);
+		throw new DaemonSupervisorOwnershipLostError(owner.generation, { socketPath: owner.socketPath, registryDir });
 	}
 	const fingerprint = ownerRecordFingerprint(current);
 	if (fingerprint !== validatedFingerprint && !isProcessIdentityAlive(current)) {
-		throw new DaemonSupervisorOwnershipLostError(owner.generation);
+		throw new DaemonSupervisorOwnershipLostError(owner.generation, { socketPath: owner.socketPath, registryDir });
 	}
 	return fingerprint;
 }

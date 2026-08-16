@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	acquireDaemonSupervisorOwnership,
 	defaultDaemonSupervisorRegistryDir,
@@ -93,5 +94,41 @@ describe("daemon supervisor ownership registry", () => {
 		await expect(reaped.assertCurrent()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
 		expect(existsSync(reapedDir)).toBe(false);
 		await reaped.release();
+	});
+
+	it("disambiguates never-acquired from lost-on-disk ownership errors", async () => {
+		const paths = createPaths();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype) as object, {
+			ownership: undefined,
+			generation: "unowned-generation",
+			socketPath: paths.socketPath,
+		});
+		const assertCurrentOwnership = Reflect.get(supervisor, "assertCurrentOwnership") as () => Promise<void>;
+		const neverAcquired = await assertCurrentOwnership
+			.call(supervisor)
+			.then(() => undefined)
+			.catch((error: unknown) => error as Error & { code?: string });
+		if (!neverAcquired) throw new Error("assertCurrentOwnership did not throw");
+		expect(neverAcquired.code).toBe("supervisor_generation_stale");
+		expect(neverAcquired.message).toContain("holds no registry ownership");
+		expect(neverAcquired.message).toContain(paths.socketPath);
+		expect(neverAcquired.message).toContain("sessions are preserved");
+
+		const ownership = await acquire(paths);
+		const ownerPath = join(ownerDir(paths, ownership.record.generation), "owner.json");
+		const foreign = { ...readJson(ownerPath), token: "successor-token" };
+		writeFileSync(ownerPath, `${JSON.stringify(foreign, null, 2)}\n`);
+		const lostOnDisk = await ownership
+			.assertCurrent()
+			.then(() => undefined)
+			.catch((error: unknown) => error as Error & { code?: string });
+		if (!lostOnDisk) throw new Error("assertCurrent did not throw");
+		expect(lostOnDisk.code).toBe("supervisor_generation_stale");
+		expect(lostOnDisk.message).toContain("no longer owns its registry entry");
+		expect(lostOnDisk.message).toContain(paths.socketPath);
+		expect(lostOnDisk.message).toContain(paths.registryDir);
+		expect(lostOnDisk.message).toContain("sessions are preserved");
+		expect(lostOnDisk.message).not.toBe(neverAcquired.message);
+		await ownership.release();
 	});
 });
