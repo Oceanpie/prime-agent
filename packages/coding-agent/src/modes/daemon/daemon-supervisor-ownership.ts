@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 import { getProcessStartId } from "../../core/session-lease.js";
+import { defaultDaemonSocketDir } from "./daemon-socket.js";
 
 const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 
@@ -314,8 +315,42 @@ class DaemonShutdownAdmission {
  * $TMPDIR (whose files macOS dirhelper deletes after 3 days) and outside the
  * per-invocation agent dir.
  */
-export function defaultDaemonSupervisorRegistryDir(environment: NodeJS.ProcessEnv = process.env): string {
+function defaultDaemonSupervisorRegistryDir(environment: NodeJS.ProcessEnv = process.env): string {
 	return environment[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV] ?? join(homedir(), ".prime", "supervisor-owners");
+}
+
+/**
+ * Pre-move registry location under $TMPDIR, consulted READ-ONLY while daemons
+ * from before the ~/.prime move may still be running; gated off whenever the
+ * registry is overridden. Remove after one release.
+ */
+function legacyDaemonSupervisorRegistryDir(environment: NodeJS.ProcessEnv = process.env): string | undefined {
+	return environment[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV]
+		? undefined
+		: resolve(defaultDaemonSocketDir(), "supervisor-owners");
+}
+
+/**
+ * Non-mutating legacy scan: never reclaims abandoned directories (old-build
+ * daemons own that location's lifecycle) and runs without the legacy guard —
+ * best-effort is acceptable because records are written rename-atomically.
+ */
+function readLegacyOwnersForSocket(
+	legacyRegistryDir: string,
+	normalizedSocketPath: string,
+): DaemonSupervisorOwnerRecord[] {
+	let entries: string[];
+	try {
+		entries = readdirSync(legacyRegistryDir);
+	} catch {
+		return [];
+	}
+	return entries
+		.filter((name) => name.endsWith(".owner"))
+		.flatMap((name) => {
+			const owner = readOwnerRecord(resolve(legacyRegistryDir, name));
+			return owner && owner.socketPath === normalizedSocketPath ? [owner] : [];
+		});
 }
 
 async function withDaemonSupervisorRegistryGuard<T>(registryDir: string, action: () => T | Promise<T>): Promise<T> {
@@ -438,9 +473,13 @@ export async function assertDaemonSupervisorOwnerCurrent(
 		socketPath: string;
 	},
 	validatedFingerprint?: string,
+	registryDir?: string,
+	legacyRegistryDir: string | undefined = registryDir === undefined ? legacyDaemonSupervisorRegistryDir() : undefined,
 ): Promise<string> {
-	const registryDir = defaultDaemonSupervisorRegistryDir();
-	const current = readOwnerRecord(ownerDirectoryPath(registryDir, owner.generation));
+	registryDir ??= defaultDaemonSupervisorRegistryDir();
+	const current =
+		readOwnerRecord(ownerDirectoryPath(registryDir, owner.generation)) ??
+		(legacyRegistryDir ? readOwnerRecord(ownerDirectoryPath(legacyRegistryDir, owner.generation)) : undefined);
 	if (
 		!current ||
 		current.pid !== owner.pid ||
@@ -493,8 +532,10 @@ export async function isDaemonShutdownAdmissionActive(): Promise<boolean> {
 export async function persistDaemonStartupFenceFromOwner(
 	socketPath: string,
 	hello: DaemonSupervisorHelloIdentity,
-	registryDir: string = defaultDaemonSupervisorRegistryDir(),
+	registryDir?: string,
+	legacyRegistryDir: string | undefined = registryDir === undefined ? legacyDaemonSupervisorRegistryDir() : undefined,
 ): Promise<void> {
+	registryDir ??= defaultDaemonSupervisorRegistryDir();
 	mkdirSync(registryDir, { recursive: true, mode: 0o700 });
 	const fenceDirectory = resolve(registryDir, "startup-fences");
 	mkdirSync(fenceDirectory, { recursive: true, mode: 0o700 });
@@ -505,7 +546,10 @@ export async function persistDaemonStartupFenceFromOwner(
 			const owner = readOwnerRecordForScope(directory, (scope) => scope.socketPath === normalizedSocketPath);
 			return owner ? [owner] : [];
 		});
-		const matchingOwners = owners.filter((owner) => owner.socketPath === normalizedSocketPath);
+		let matchingOwners = owners.filter((owner) => owner.socketPath === normalizedSocketPath);
+		if (matchingOwners.length === 0 && legacyRegistryDir) {
+			matchingOwners = readLegacyOwnersForSocket(legacyRegistryDir, normalizedSocketPath);
+		}
 		if (matchingOwners.length === 0) {
 			throw new Error(`Daemon supervisor owner does not match ${socketPath}`);
 		}

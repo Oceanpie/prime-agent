@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,7 +7,7 @@ import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	acquireDaemonShutdownAdmission,
 	acquireDaemonSupervisorOwnership,
-	defaultDaemonSupervisorRegistryDir,
+	persistDaemonStartupFenceFromOwner,
 } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 
 type Ownership = Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
@@ -75,10 +75,54 @@ function readJson(path: string): OwnerRecord {
 }
 
 describe("daemon supervisor ownership registry", () => {
-	it("derives the default registry from the durable per-user directory, env override first", () => {
-		// Never touch the real ~/.prime from tests: probe the derivation only.
-		expect(defaultDaemonSupervisorRegistryDir({})).toBe(join(homedir(), ".prime", "supervisor-owners"));
-		expect(defaultDaemonSupervisorRegistryDir({ [registryDirEnv]: "/custom/registry" })).toBe("/custom/registry");
+	it("finds a live pre-move owner through the legacy registry when persisting a fence", async () => {
+		const paths = createPaths();
+		const legacyDir = join(paths.root, "legacy-registry");
+		const legacyOwner = await acquireDaemonSupervisorOwnership({
+			agentDir: paths.agentDir,
+			appVersion: "test",
+			descriptorDir: paths.descriptorDir,
+			generation: "legacy-owner",
+			registryDir: legacyDir,
+			socketPath: paths.socketPath,
+		});
+		const record = legacyOwner.record;
+		if (!record.processStartId) return;
+		const hello = {
+			supervisorGeneration: record.generation,
+			supervisorOwnerToken: record.token,
+			supervisorPid: record.pid,
+			supervisorProcessStartId: record.processStartId,
+			supervisorSocketPath: record.socketPath,
+		};
+		const legacyOwnerPath = join(legacyDir, "legacy-owner.owner", "owner.json");
+		const legacyBytes = readFileSync(legacyOwnerPath, "utf8");
+
+		await persistDaemonStartupFenceFromOwner(paths.socketPath, hello, paths.registryDir, legacyDir);
+
+		// The fence lands in the NEW registry; the legacy record is untouched.
+		expect(readdirSync(join(paths.registryDir, "startup-fences"))).toHaveLength(1);
+		expect(readFileSync(legacyOwnerPath, "utf8")).toBe(legacyBytes);
+
+		// Without a legacy dir the same scan fails: the fallback never fires for
+		// an explicitly provided registry.
+		await expect(persistDaemonStartupFenceFromOwner(paths.socketPath, hello, paths.registryDir)).rejects.toThrow(
+			/does not match/,
+		);
+		await legacyOwner.release();
+	});
+
+	it("legacy registry reads never reclaim abandoned legacy directories", async () => {
+		const paths = createPaths();
+		const legacyDir = join(paths.root, "legacy-registry");
+		const abandoned = join(legacyDir, "abandoned.owner");
+		mkdirSync(abandoned, { recursive: true });
+
+		await expect(
+			persistDaemonStartupFenceFromOwner(paths.socketPath, {}, paths.registryDir, legacyDir),
+		).rejects.toThrow(/does not match/);
+
+		expect(existsSync(abandoned)).toBe(true);
 	});
 
 	it("marks ownership lost when the record is mismatched or absent", async () => {
