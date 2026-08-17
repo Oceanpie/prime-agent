@@ -484,7 +484,7 @@ describe("#502 unified session view regressions", () => {
 				runtimeKind: "subagent" as const,
 				summary: "",
 				model: { provider: "prime-inference", id: "gpt-5.6-terra" } as SessionSummary["model"],
-				thinkingLevel: "high" as const,
+				thinkingLevel: "high" as SessionSummary["thinkingLevel"],
 			},
 			title: "Inspect agents view",
 			subtitle: "",
@@ -513,6 +513,9 @@ describe("#502 unified session view regressions", () => {
 			);
 
 		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra:high");
+		subagent.summary.thinkingLevel = "off";
+		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra");
+		expect(render(100)).not.toContain(":off");
 		expect(render(20)).toHaveLength(20);
 	});
 });
