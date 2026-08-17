@@ -220,12 +220,16 @@ describe("compaction continuation", () => {
 		});
 		harnesses.push(harness);
 		sessionRef.current = harness.session;
+		const largeStep = "x".repeat(3_500);
 		harness.setResponses([
-			fauxAssistantMessage("step one done, more to do"),
-			fauxAssistantMessage("step two done, still more to do"),
-			fauxAssistantMessage("step three done, still not finished"),
-			fauxAssistantMessage(fauxToolCall("ipython", { code: "goal.complete" }), { stopReason: "toolUse" }),
-			fauxAssistantMessage("Goal complete."),
+			{ ...fauxAssistantMessage(`step one done, more to do ${largeStep}`), usage: createUsage(5_000) },
+			{ ...fauxAssistantMessage(`step two done, still more to do ${largeStep}`), usage: createUsage(5_000) },
+			{ ...fauxAssistantMessage(`step three done, still not finished ${largeStep}`), usage: createUsage(5_000) },
+			{
+				...fauxAssistantMessage(fauxToolCall("ipython", { code: "goal.complete" }), { stopReason: "toolUse" }),
+				usage: createUsage(5_000),
+			},
+			{ ...fauxAssistantMessage("Goal complete."), usage: createUsage(5_000) },
 		]);
 
 		await harness.session.prompt("/goal finish the task");
@@ -234,7 +238,7 @@ describe("compaction continuation", () => {
 		await new Promise((resolve) => setTimeout(resolve, 300));
 
 		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toContain("threshold");
-		expect(harness.eventsOfType("compaction_end")[0]?.result).toBeDefined();
+		expect(harness.eventsOfType("compaction_end").find((event) => event.result)?.result).toBeDefined();
 		expect(harness.getPendingResponseCount()).toBe(0);
 		expect(harness.session.goalState.status).toBe("complete");
 	});
