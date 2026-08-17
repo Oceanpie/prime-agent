@@ -470,4 +470,44 @@ describe("#502 unified session view regressions", () => {
 		);
 		expect(rendered).toMatch(/123456 · 2h\s*$/);
 	});
+
+	test("subagent rows show their model and effective effort within the existing responsive title cell", () => {
+		const subagent = {
+			kind: "subagent" as const,
+			section: "idle" as const,
+			summary: {
+				...summary("effort-child"),
+				runtimeKind: "subagent" as const,
+				model: { provider: "prime-inference", id: "gpt-5.6-terra" } as SessionSummary["model"],
+				thinkingLevel: "high" as const,
+			},
+			title: "Inspect agents view",
+			subtitle: "",
+			statusLabel: "idle",
+			depth: 1,
+			selectable: true,
+			runningSubagentCount: 0,
+			identity: "effort-child",
+			parentIdentity: "parent",
+		};
+		const harness = {
+			rows: [subagent],
+			selectedIndex: 0,
+			isPendingDeleteRow: () => false,
+			isPendingKillSubagentRow: () => false,
+			getRowIcon: () => "·",
+			formatRowIcon: (_section: string, icon: string) => icon,
+		};
+		const render = (width: number) =>
+			stripAnsi(
+				privateMethod<(this: typeof harness, row: typeof subagent, width: number) => string>("renderRow").call(
+					harness,
+					subagent,
+					width,
+				),
+			);
+
+		expect(render(100)).toContain("prime-inference/gpt-5.6-terra:high");
+		expect(render(20)).toHaveLength(20);
+	});
 });

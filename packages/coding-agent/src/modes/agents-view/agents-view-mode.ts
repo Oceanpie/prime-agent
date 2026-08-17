@@ -2556,7 +2556,12 @@ export class AgentsViewMode implements Component, Focusable {
 		// "fix auth · Refactoring token validation". Hidden during delete/stop
 		// confirmations so the warning text stands alone.
 		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
-		const titleContent = summaryText ? `${title} ${theme.fg("dim", `· ${summaryText}`)}` : title;
+		const modelLabel =
+			row.kind === "subagent" && !pendingKill && row.summary.model
+				? `${row.summary.model.provider}/${row.summary.model.id}${row.summary.thinkingLevel ? `:${row.summary.thinkingLevel}` : ""}`
+				: undefined;
+		const suffixes = [summaryText, modelLabel].filter((suffix): suffix is string => suffix !== undefined);
+		const titleContent = suffixes.length > 0 ? `${title} ${theme.fg("dim", `· ${suffixes.join(" · ")}`)}` : title;
 		const titleCell = formatTableCell(titleContent, titleWidth);
 		const cells = [
 			icon,
