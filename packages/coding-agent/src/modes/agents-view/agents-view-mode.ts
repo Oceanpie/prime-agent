@@ -2557,7 +2557,7 @@ export class AgentsViewMode implements Component, Focusable {
 		// confirmations so the warning text stands alone.
 		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
 		const modelLabel =
-			row.kind === "subagent" && !pendingKill && row.summary.model
+			row.summary.runtimeKind === "subagent" && !pendingDelete && !pendingKill && row.summary.model
 				? `${row.summary.model.provider}/${row.summary.model.id}${row.summary.thinkingLevel ? `:${row.summary.thinkingLevel}` : ""}`
 				: undefined;
 		const suffixes = [summaryText, modelLabel].filter((suffix): suffix is string => suffix !== undefined);

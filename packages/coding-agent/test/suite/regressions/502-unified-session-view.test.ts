@@ -473,7 +473,9 @@ describe("#502 unified session view regressions", () => {
 
 	test("subagent rows show their model and effective effort within the existing responsive title cell", () => {
 		const subagent = {
-			kind: "subagent" as const,
+			// Direct children in a scoped Agents View render as agent rows while
+			// retaining their persisted subagent runtime kind.
+			kind: "agent" as const,
 			section: "idle" as const,
 			summary: {
 				...summary("effort-child"),
@@ -492,7 +494,7 @@ describe("#502 unified session view regressions", () => {
 		};
 		const harness = {
 			rows: [subagent],
-			selectedIndex: 0,
+			selectedIndex: -1,
 			isPendingDeleteRow: () => false,
 			isPendingKillSubagentRow: () => false,
 			getRowIcon: () => "·",
