@@ -2,6 +2,7 @@ import stripAnsi from "strip-ansi";
 import { describe, expect, test, vi } from "vitest";
 import { AgentsViewMode } from "../../../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
+import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 import { createDeferred as deferred } from "../scheduling.js";
 
 function summary(id: string): SessionSummary {
@@ -472,6 +473,7 @@ describe("#502 unified session view regressions", () => {
 	});
 
 	test("subagent rows show their model and effective effort within the existing responsive title cell", () => {
+		initTheme("dark");
 		const subagent = {
 			// Direct children in a scoped Agents View render as agent rows while
 			// retaining their persisted subagent runtime kind.
@@ -480,6 +482,7 @@ describe("#502 unified session view regressions", () => {
 			summary: {
 				...summary("effort-child"),
 				runtimeKind: "subagent" as const,
+				summary: "",
 				model: { provider: "prime-inference", id: "gpt-5.6-terra" } as SessionSummary["model"],
 				thinkingLevel: "high" as const,
 			},
@@ -509,7 +512,7 @@ describe("#502 unified session view regressions", () => {
 				),
 			);
 
-		expect(render(100)).toContain("prime-inference/gpt-5.6-terra:high");
+		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra:high");
 		expect(render(20)).toHaveLength(20);
 	});
 });

@@ -2560,7 +2560,9 @@ export class AgentsViewMode implements Component, Focusable {
 			row.summary.runtimeKind === "subagent" && !pendingDelete && !pendingKill && row.summary.model
 				? `${row.summary.model.provider}/${row.summary.model.id}${row.summary.thinkingLevel ? `:${row.summary.thinkingLevel}` : ""}`
 				: undefined;
-		const suffixes = [summaryText, modelLabel].filter((suffix): suffix is string => suffix !== undefined);
+		const suffixes = [summaryText, modelLabel].filter(
+			(suffix): suffix is string => suffix !== undefined && suffix.length > 0,
+		);
 		const titleContent = suffixes.length > 0 ? `${title} ${theme.fg("dim", `· ${suffixes.join(" · ")}`)}` : title;
 		const titleCell = formatTableCell(titleContent, titleWidth);
 		const cells = [
