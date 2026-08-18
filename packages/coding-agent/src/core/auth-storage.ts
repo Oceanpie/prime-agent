@@ -583,6 +583,10 @@ export class AuthStorage {
 		return this.getAuthSourceTokenForCandidate(provider, candidate);
 	}
 
+	getStaleAuthSourceToken(provider: string): AuthSourceToken | undefined {
+		return this.staleAuthSources.get(provider)?.at(-1);
+	}
+
 	markAuthSourceStale(token: AuthSourceToken): boolean {
 		if (token.provider.length === 0) {
 			return false;
@@ -599,6 +603,24 @@ export class AuthStorage {
 			stale.push(token);
 		}
 		this.staleAuthSources.set(token.provider, stale);
+		return true;
+	}
+
+	clearAuthSourceStale(token: AuthSourceToken): boolean {
+		const stale = this.staleAuthSources.get(token.provider);
+		if (!stale) return false;
+		const next = stale.filter(
+			(existing) =>
+				existing.source !== token.source ||
+				existing.identityFingerprint !== token.identityFingerprint ||
+				existing.valueFingerprint !== token.valueFingerprint,
+		);
+		if (next.length === stale.length) return false;
+		if (next.length === 0) {
+			this.staleAuthSources.delete(token.provider);
+		} else {
+			this.staleAuthSources.set(token.provider, next);
+		}
 		return true;
 	}
 

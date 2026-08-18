@@ -1,7 +1,18 @@
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.js";
+import { InProcessAgentConnection } from "../../../src/modes/agent-connection/in-process-agent-connection.js";
 import { createHarness, type Harness } from "../harness.js";
+
+function runtimeHostFor(session: unknown): AgentSessionRuntime {
+	return {
+		session,
+		setRebindSession() {},
+		setBeforeSessionInvalidate() {},
+		async dispose() {},
+	} as unknown as AgentSessionRuntime;
+}
 
 function provider401Message(): AssistantMessage {
 	return {
@@ -42,10 +53,29 @@ function provider500Message(): AssistantMessage {
 	};
 }
 
+const staleRecoveryModels = [
+	{ id: "faux-1", name: "Faux One" },
+	{ id: "faux-2", name: "Faux Two" },
+];
+
+function markHarnessProviderAuthStale(harness: Harness, provider: string): void {
+	let marked = false;
+	while (harness.session.modelRegistry.markProviderAuthStale(provider)) marked = true;
+	expect(marked).toBe(true);
+	expect(harness.session.modelRegistry.getProviderAuthStatus(provider)).toMatchObject({ source: "stale" });
+}
+
+function preserveFauxProviderDuringModelRefresh(harness: Harness): void {
+	vi.spyOn(harness.session.modelRegistry, "refreshAvailableModels").mockImplementation(async () =>
+		harness.session.modelRegistry.getAvailable(),
+	);
+}
+
 describe("issue #4491 provider stale after repeated 401", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -235,6 +265,85 @@ describe("issue #4491 provider stale after repeated 401", () => {
 		expect(harness.eventsOfType("auto_retry_start")).toHaveLength(0);
 		expect(harness.authStorage.hasAuth(harness.getModel().provider)).toBe(false);
 		await expect(harness.authStorage.getApiKey(harness.getModel().provider)).resolves.toBeUndefined();
+	});
+
+	it("keeps auth stale after an explicit same-provider model selection", async () => {
+		const harness = await createHarness({ models: staleRecoveryModels });
+		harnesses.push(harness);
+		const provider = harness.getModel().provider;
+		const nextModel = harness.getModel("faux-2")!;
+		markHarnessProviderAuthStale(harness, provider);
+		preserveFauxProviderDuringModelRefresh(harness);
+
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		await connection.setModel(provider, nextModel.id);
+
+		expect(harness.session.model?.id).toBe(nextModel.id);
+		expect(harness.session.modelRegistry.getProviderAuthStatus(provider)).toMatchObject({ source: "stale" });
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	it("clears the stale auth source after the selected model succeeds", async () => {
+		const harness = await createHarness({ models: staleRecoveryModels });
+		harnesses.push(harness);
+		const provider = harness.getModel().provider;
+		const nextModel = harness.getModel("faux-2")!;
+		markHarnessProviderAuthStale(harness, provider);
+		preserveFauxProviderDuringModelRefresh(harness);
+		harness.setResponses([fauxAssistantMessage("ok")]);
+
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		await connection.setModel(provider, nextModel.id);
+		await harness.session.prompt("hello");
+
+		expect(harness.session.modelRegistry.getProviderAuthStatus(provider)).toMatchObject({ configured: true });
+	});
+
+	it("restores the stale auth source after the selected model fails", async () => {
+		const harness = await createHarness({
+			models: staleRecoveryModels,
+			settings: { retry: { enabled: false } },
+		});
+		harnesses.push(harness);
+		const provider = harness.getModel().provider;
+		const nextModel = harness.getModel("faux-2")!;
+		markHarnessProviderAuthStale(harness, provider);
+		preserveFauxProviderDuringModelRefresh(harness);
+		harness.setResponses([provider500Message()]);
+
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		await connection.setModel(provider, nextModel.id);
+		await harness.session.prompt("hello");
+
+		expect(harness.session.modelRegistry.getProviderAuthStatus(provider)).toMatchObject({ source: "stale" });
+	});
+
+	it("keeps the original failed model gated until the selected model succeeds", async () => {
+		const harness = await createHarness({ models: staleRecoveryModels });
+		harnesses.push(harness);
+		const originalModel = harness.getModel();
+		const nextModel = harness.getModel("faux-2")!;
+		markHarnessProviderAuthStale(harness, originalModel.provider);
+		preserveFauxProviderDuringModelRefresh(harness);
+
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		await connection.setModel(originalModel.provider, nextModel.id);
+		await expect(connection.setModel(originalModel.provider, originalModel.id)).rejects.toThrow();
+
+		expect(harness.session.modelRegistry.getProviderAuthStatus(originalModel.provider)).toMatchObject({
+			source: "stale",
+		});
+	});
+
+	it("keeps direct internal model changes on the standard auth gate", async () => {
+		const harness = await createHarness({ models: staleRecoveryModels });
+		harnesses.push(harness);
+		const nextModel = harness.getModel("faux-2")!;
+		markHarnessProviderAuthStale(harness, nextModel.provider);
+
+		await expect(harness.session.setModel(nextModel)).rejects.toThrow(
+			`No API key for ${nextModel.provider}/${nextModel.id}`,
+		);
 	});
 
 	it("resolves retry state for auth failures surfaced only on agent_end", async () => {

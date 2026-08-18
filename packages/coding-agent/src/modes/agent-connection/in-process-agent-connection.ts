@@ -409,13 +409,18 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
 		const availableModels = await this.session.modelRegistry.refreshAvailableModels();
-		const model = availableModels.find((candidate) => {
+		const availableModel = availableModels.find((candidate) => {
 			return candidate.provider === provider && candidate.id === modelId;
 		});
-		if (!model) {
+		if (availableModel) {
+			await this.session.setModel(availableModel);
+			return availableModel;
+		}
+
+		const model = this.session.modelRegistry.find(provider, modelId);
+		if (!model || !(await this.session.trySetModelForStaleAuthRecovery(model))) {
 			throw new Error(`Model not found: ${provider}/${modelId}`);
 		}
-		await this.session.setModel(model);
 		return model;
 	}
 

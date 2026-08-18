@@ -1251,6 +1251,13 @@ export class ModelRegistry {
 		};
 	}
 
+	getStaleProviderAuthSourceToken(provider: string): AuthSourceToken | undefined {
+		return (
+			this.staleProviderRequestAuthSources.get(provider)?.at(-1) ??
+			this.authStorage.getStaleAuthSourceToken(provider)
+		);
+	}
+
 	markProviderAuthSourceStale(token: AuthSourceToken): boolean {
 		let marked = false;
 		const providerRequestSource = this.getProviderRequestAuthSource(token.provider);
@@ -1278,6 +1285,23 @@ export class ModelRegistry {
 		}
 
 		return marked;
+	}
+
+	clearProviderAuthSourceStale(token: AuthSourceToken): boolean {
+		const stale = this.staleProviderRequestAuthSources.get(token.provider);
+		const next = stale?.filter(
+			(existing) =>
+				existing.source !== token.source ||
+				existing.identityFingerprint !== token.identityFingerprint ||
+				existing.valueFingerprint !== token.valueFingerprint,
+		);
+		const clearedProviderRequestAuth = stale !== undefined && next !== undefined && next.length < stale.length;
+		if (next?.length === 0) {
+			this.staleProviderRequestAuthSources.delete(token.provider);
+		} else if (clearedProviderRequestAuth) {
+			this.staleProviderRequestAuthSources.set(token.provider, next);
+		}
+		return this.authStorage.clearAuthSourceStale(token) || clearedProviderRequestAuth;
 	}
 
 	private getModelRequestKey(provider: string, modelId: string): string {

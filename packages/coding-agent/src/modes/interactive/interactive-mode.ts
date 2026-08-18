@@ -2756,6 +2756,17 @@ export class InteractiveMode {
 		this.updateEditorBorderColor();
 	}
 
+	private applySuccessfulProviderAuth(message: AssistantMessage): void {
+		if (message.stopReason === "error" || message.stopReason === "aborted") return;
+		const sourceToken = this.modelRegistry.getStaleProviderAuthSourceToken(message.provider);
+		if (sourceToken) this.modelRegistry.clearProviderAuthSourceStale(sourceToken);
+		if (!this.modelRegistry.getProviderAuthStatus(message.provider).configured) return;
+		this.connectionConfiguredProviders.add(message.provider);
+		this.connectionModels = this.connectionModelCatalog.filter((candidate) =>
+			this.connectionConfiguredProviders.has(candidate.provider),
+		);
+	}
+
 	private getCurrentModel(): AgentConnectionModel | undefined {
 		return this.connectionState?.model;
 	}
@@ -5529,6 +5540,7 @@ export class InteractiveMode {
 			case "message_end":
 				if (event.message.role === "user") break;
 				if (event.message.role === "assistant") {
+					this.applySuccessfulProviderAuth(event.message);
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
@@ -7793,7 +7805,21 @@ export class InteractiveMode {
 	}
 
 	private isModelProviderConfigured(model: AgentConnectionModel): boolean {
-		return this.connectionConfiguredProviders.has(model.provider) || this.modelRegistry.hasConfiguredAuth(model);
+		return (
+			this.connectionConfiguredProviders.has(model.provider) ||
+			this.modelRegistry.hasConfiguredAuth(model) ||
+			this.isStaleAuthRecoveryModelSwitch(model)
+		);
+	}
+
+	private isStaleAuthRecoveryModelSwitch(model: AgentConnectionModel): boolean {
+		const currentModel = this.getCurrentModel();
+		return (
+			currentModel !== undefined &&
+			currentModel.provider === model.provider &&
+			currentModel.id !== model.id &&
+			this.modelRegistry.getProviderAuthStatus(model.provider).source === "stale"
+		);
 	}
 
 	private applyConnectionModelCatalog(catalog: AgentConnectionModelCatalog): void {

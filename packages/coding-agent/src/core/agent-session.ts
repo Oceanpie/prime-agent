@@ -906,6 +906,14 @@ interface ModelSelectOptions {
 	waitForExtensions?: boolean;
 }
 
+interface StaleAuthRecoveryLease {
+	provider: string;
+	failedModelId: string;
+	targetModelId: string;
+	sourceToken: AuthSourceToken;
+	active: boolean;
+}
+
 interface ToolDefinitionEntry {
 	definition: ToolDefinition;
 	sourceInfo: SourceInfo;
@@ -1152,6 +1160,7 @@ export class AgentSession {
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
+	private _staleAuthRecovery: StaleAuthRecoveryLease | undefined = undefined;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
@@ -2022,15 +2031,20 @@ export class AgentSession {
 	}
 
 	private async _validateCanStartAgentRun(): Promise<void> {
-		if (!this.model) {
-			throw new Error(formatNoModelSelectedMessage());
-		}
-		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
-			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
-			if (isOAuth) {
-				throw new Error(formatAuthenticationFailedMessage(this.model.provider));
+		this._beginStaleAuthRecovery();
+		try {
+			if (!this.model) {
+				throw new Error(formatNoModelSelectedMessage());
 			}
-			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+			if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
+				const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
+				if (isOAuth) {
+					throw new Error(formatAuthenticationFailedMessage(this.model.provider));
+				}
+				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+			}
+		} finally {
+			this._pauseStaleAuthRecovery();
 		}
 	}
 
@@ -3541,6 +3555,14 @@ export class AgentSession {
 		}
 
 		this._addLoginGuidanceToAuthError(event);
+		if (
+			event.type === "message_end" &&
+			event.message.role === "assistant" &&
+			event.message.stopReason !== "error" &&
+			event.message.stopReason !== "aborted"
+		) {
+			this._finishStaleAuthRecovery(true, event.message as AssistantMessage);
+		}
 
 		// Notify all listeners
 		this._emit(event);
@@ -3613,6 +3635,7 @@ export class AgentSession {
 		}
 
 		if (clearedDispatchEnded) {
+			this._finishStaleAuthRecovery(false);
 			return;
 		}
 
@@ -3623,6 +3646,7 @@ export class AgentSession {
 				(this._retryPromise ? this._findLastAssistantInMessages(event.messages) : undefined);
 			this._lastAssistantMessage = undefined;
 			if (!msg) {
+				this._finishStaleAuthRecovery(false);
 				this._resolveRetry();
 				return;
 			}
@@ -3649,6 +3673,7 @@ export class AgentSession {
 			this._finishActiveRetryWithFailure(msg);
 			this._resolveRetry();
 			if (!compactionWillRetry) {
+				this._finishStaleAuthRecovery(false);
 				this._finishGoalForTerminalAssistantMessage(msg);
 				// In serialized mode, agent-callable refine.run is serviced
 				// at the shouldStopAfterTurn boundary, not here at agent_end.
@@ -5836,6 +5861,7 @@ export class AgentSession {
 					for (const action of turns) transitionSessionAction(action, { state: "committing" });
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
+					this._beginStaleAuthRecovery();
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
@@ -5858,6 +5884,7 @@ export class AgentSession {
 			}
 			this._forgetConsumedPostCompactionContinuations(turns.map((action) => primaryDeliveryRecord(action).message));
 		} catch (error) {
+			this._finishStaleAuthRecovery(false);
 			const delivered = new Set(this.agent.state.messages);
 			this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
 			for (const action of actions) {
@@ -6727,6 +6754,58 @@ export class AgentSession {
 		});
 	}
 
+	private _beginStaleAuthRecovery(): void {
+		const recovery = this._staleAuthRecovery;
+		const model = this.model;
+		if (
+			!recovery ||
+			recovery.active ||
+			!model ||
+			model.provider !== recovery.provider ||
+			model.id !== recovery.targetModelId
+		) {
+			return;
+		}
+		if (this._modelRegistry.clearProviderAuthSourceStale(recovery.sourceToken)) {
+			recovery.active = true;
+		} else {
+			this._staleAuthRecovery = undefined;
+		}
+	}
+
+	private _pauseStaleAuthRecovery(): void {
+		const recovery = this._staleAuthRecovery;
+		if (!recovery?.active) return;
+		this._modelRegistry.markProviderAuthSourceStale(recovery.sourceToken);
+		recovery.active = false;
+	}
+
+	private _finishStaleAuthRecovery(success: boolean, message?: AssistantMessage): void {
+		const recovery = this._staleAuthRecovery;
+		if (!recovery?.active) return;
+		if (success && (message?.provider !== recovery.provider || message.model !== recovery.targetModelId)) return;
+		if (!success) this._modelRegistry.markProviderAuthSourceStale(recovery.sourceToken);
+		this._staleAuthRecovery = undefined;
+	}
+
+	private async _applyModelSelection(model: Model<any>, options: ModelSelectOptions): Promise<void> {
+		const previousModel = this.model;
+		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		const serviceTier = this._getServiceTierForModelSwitch();
+		this.agent.state.model = model;
+		this.sessionManager.appendModelChange(model.provider, model.id);
+		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		this.setThinkingLevel(thinkingLevel);
+		this._clampServiceTierForModel(serviceTier);
+
+		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set");
+		if (this._shouldWaitForModelSelectEmit(options)) {
+			await emitPromise;
+		} else {
+			this._trackModelSelectEmitError(emitPromise);
+		}
+	}
+
 	private _queueModelSelectEmit(
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
@@ -6758,24 +6837,46 @@ export class AgentSession {
 		if (!(await this._modelRegistry.canUseModel(model))) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
 		}
+		if (!this._staleAuthRecovery?.active) this._staleAuthRecovery = undefined;
+		await this._applyModelSelection(model, options);
+	}
 
-		const previousModel = this.model;
-		const thinkingLevel = this._getThinkingLevelForModelSwitch();
-		const serviceTier = this._getServiceTierForModelSwitch();
-		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-
-		// Re-clamp thinking level for new model's capabilities
-		this.setThinkingLevel(thinkingLevel);
-		this._clampServiceTierForModel(serviceTier);
-
-		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set");
-		if (this._shouldWaitForModelSelectEmit(options)) {
-			await emitPromise;
-		} else {
-			this._trackModelSelectEmitError(emitPromise);
+	async trySetModelForStaleAuthRecovery(model: Model<any>, options: ModelSelectOptions = {}): Promise<boolean> {
+		const currentModel = this.model;
+		if (
+			!currentModel ||
+			currentModel.provider !== model.provider ||
+			currentModel.id === model.id ||
+			this._modelRegistry.getProviderAuthStatus(model.provider).source !== "stale"
+		) {
+			return false;
 		}
+		const existing = this._staleAuthRecovery;
+		const failedModelId = existing?.provider === model.provider ? existing.failedModelId : currentModel.id;
+		if (failedModelId === model.id) return false;
+		const sourceToken =
+			existing?.provider === model.provider
+				? existing.sourceToken
+				: this._modelRegistry.getStaleProviderAuthSourceToken(model.provider);
+		if (!sourceToken || !this._modelRegistry.clearProviderAuthSourceStale(sourceToken)) return false;
+
+		let available: boolean;
+		try {
+			available = await this._modelRegistry.canUseModel(model);
+		} finally {
+			this._modelRegistry.markProviderAuthSourceStale(sourceToken);
+		}
+		if (!available) return false;
+
+		this._staleAuthRecovery = {
+			provider: model.provider,
+			failedModelId,
+			targetModelId: model.id,
+			sourceToken,
+			active: false,
+		};
+		await this._applyModelSelection(model, options);
+		return true;
 	}
 
 	private _trackModelSelectEmitError(emitPromise: Promise<void>): void {

@@ -4574,15 +4574,19 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const session = state.runtime.session;
 				const availableModels = await session.modelRegistry.refreshAvailableModels();
-				const model = availableModels.find((candidate) => {
+				const availableModel = availableModels.find((candidate) => {
 					return candidate.provider === command.provider && candidate.id === command.modelId;
 				});
-				if (!model) {
+				const waitForExtensions = !(session.isStreaming || session.isCompacting);
+				if (availableModel) {
+					await session.setModel(availableModel, { waitForExtensions });
+					return success(command.id, "set_model", availableModel);
+				}
+
+				const model = session.modelRegistry.find(command.provider, command.modelId);
+				if (!model || !(await session.trySetModelForStaleAuthRecovery(model, { waitForExtensions }))) {
 					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
 				}
-				await session.setModel(model, {
-					waitForExtensions: !(session.isStreaming || session.isCompacting),
-				});
 				return success(command.id, "set_model", model);
 			}
 
